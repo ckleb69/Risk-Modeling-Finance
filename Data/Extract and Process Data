@@ -1,0 +1,82 @@
+import os
+import warnings
+import numpy as np
+import pandas as pd
+from scipy import stats
+import lmoments3 as lm
+import wrds
+
+# Conntect to Database
+db = wrds.Connection()
+
+
+tech = ["AAPL","MSFT","INTC","CSCO","IBM","AMZN",
+        "NVDA","XRX","ADBE","QCOM","HPQ","ADP"]
+ind  = ["RTX","ETN","DE","HON","UPS","FDX",
+        "UNP","BA","NOC","ROK","EMR","CAT"]
+tickers = tech + ind
+
+# Pull data from WRDS
+sql = f"""
+SELECT a.permno,
+       b.ticker,
+       a.date,
+       a.prc AS price,
+       a.vol AS volume,
+       LAG(a.prc) OVER (PARTITION BY a.permno ORDER BY a.date) AS prev_price
+FROM crsp.dsf AS a
+JOIN crsp.stocknames AS b
+  ON a.permno = b.permno
+WHERE b.ticker IN ({','.join(["'" + t + "'" for t in tickers])})
+  AND a.date BETWEEN '2000-01-01' AND '2024-12-31'
+ORDER BY b.ticker, a.date;
+"""
+df = db.raw_sql(sql)
+
+# Cleaning and preprocessing
+df["price"] = df["price"].abs()
+df["prev_price"] = df["prev_price"].abs()
+df = df[df["price"].notna() & (df["price"] != 0)]
+df["simple_ret"] = df["price"] / df["prev_price"] - 1
+df["log_ret"] = np.log(df["price"] / df["prev_price"])
+df["log_ret"] = df["log_ret"].replace([np.inf, -np.inf], np.nan)
+df = df.dropna(subset=["log_ret"]).drop_duplicates(subset=["ticker","date"], keep="last")
+df["date"] = pd.to_datetime(df["date"])
+df = df.drop(columns=["permno"], errors="ignore")
+df["sector"] = np.where(df["ticker"].isin(tech), "Tech", "Industrial")
+
+# Remove outliers via winsorization
+def winsorize(group):
+    low, high = group["log_ret"].quantile([0.005, 0.995])
+    group["log_ret"] = group["log_ret"].clip(lower=low, upper=high)
+    return group
+
+df = df.groupby("ticker", group_keys=False).apply(winsorize)
+
+# Calculate L-moments
+def lmoment_summary(x):
+    x = x.dropna()
+    if len(x) < 10:
+        return pd.Series({"L1": np.nan, "L2": np.nan, "L3/L2": np.nan, "L4/L2": np.nan})
+    try:
+        l = lm.lmom_ratios(x)
+        return pd.Series({"L1": l[0], "L2": l[1], "L3/L2": l[2], "L4/L2": l[3]})
+    except Exception:
+        return pd.Series({"L1": np.nan, "L2": np.nan, "L3/L2": np.nan, "L4/L2": np.nan})
+
+# Statistical properties
+summary = df.groupby("ticker")["log_ret"].agg([
+    ("mean", "mean"),
+    ("std", "std"),
+    ("skew", stats.skew),
+    ("kurt", lambda x: stats.kurtosis(x, fisher=True))
+])
+lm_summary = df.groupby("ticker")["log_ret"].apply(lmoment_summary)
+stats_summary = summary.join(lm_summary)
+stats_summary["sector"] = stats_summary.index.map(lambda t: "Tech" if t in tech else "Industrial")
+
+# EXPORT
+base_dir = r"C:\Kurtay Finance Project\Data"
+os.makedirs(base_dir, exist_ok=True)
+df.to_csv(os.path.join(base_dir, "CLEANWRDS.csv"), index=False)
+stats_summary.to_csv(os.path.join(base_dir, "LMoments.csv"))
