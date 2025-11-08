@@ -1,0 +1,74 @@
+import pandas as pd
+import numpy as np
+from scipy.optimize import minimize
+from scipy.special import gamma
+
+# === 1. File paths ===
+data_path = r"C:\Kurtay Finance Project\Modelling\Descriptive_LMoments.csv"   # <- your CSV file
+save_path = r"C:\Kurtay Finance Project\Modelling\PearsonVII.csv"
+
+df = pd.read_csv(data_path)
+df = df.dropna(subset=["ticker", "log_ret"])
+tickers = df["ticker"].unique()
+
+results = []
+
+# === 3. Helper: theoretical L-moment ratios of Pearson VII ===
+def pearson7_t3_t4(m):
+    """Return L-skew (τ3) and L-kurtosis (τ4) for shape parameter m."""
+    # from Hosking & Wallis (1997), eqs. for Pearson Type VII
+    if m <= 2:
+        return np.nan, np.nan
+    b = gamma(m - 0.5) / (np.sqrt(np.pi) * gamma(m))
+    r2 = (m - 1.0) / (m * b**2)
+    tau3 = 0.0                               # symmetric → 0
+    tau4 = (3*m - 5) / (3*m - 3)             # approximate L-kurtosis relation
+    return tau3, tau4
+
+# === 4. Objective: minimize |τ4_obs − τ4_theory| ===
+def objective(m, t4_obs):
+    _, t4_theo = pearson7_t3_t4(m)
+    return (t4_theo - t4_obs)**2
+
+# === 5. Fit loop ===
+for t in tickers:
+    sub = df[df["ticker"] == t]
+    try:
+        L1 = float(sub.iloc[0]["log_ret"])
+        L2 = float(sub.iloc[1]["log_ret"])
+        T3 = float(sub.iloc[2]["log_ret"])
+        T4 = float(sub.iloc[3]["log_ret"])
+    except Exception as e:
+        print(f"⚠️  {t}: bad L-moment rows ({e})")
+        continue
+
+    try:
+        # optimize shape m
+        res = minimize(objective, x0=[5], args=(T4,), bounds=[(2.1, 200)])
+        m_hat = res.x[0]
+        tau3, tau4 = pearson7_t3_t4(m_hat)
+
+        # derive scale/location (L1 = loc, L2 = scale proxy)
+        mu_hat = L1
+        sigma_hat = L2
+
+        results.append({
+            "ticker": t,
+            "mu_hat": mu_hat,
+            "sigma_hat": sigma_hat,
+            "m_hat": m_hat,
+            "L1": L1,
+            "L2": L2,
+            "L3/L2": T3,
+            "L4/L2": T4,
+            "sector": sub["sector"].iloc[0]
+        })
+        print(f"✅ {t}: μ={mu_hat:.6f}, σ={sigma_hat:.6f}, m={m_hat:.3f}")
+    except Exception as e:
+        print(f"❌ {t}: Pearson VII fit failed — {e}")
+
+# === 6. Save results ===
+out = pd.DataFrame(results)
+out.to_csv(save_path, index=False)
+print(f"\n💾 Pearson VII fits saved to:\n{save_path}")
+print(f"✅ Successfully fitted {len(out)} / {len(tickers)} tickers.")

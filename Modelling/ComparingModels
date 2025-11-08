@@ -1,0 +1,92 @@
+import pandas as pd
+import numpy as np
+
+# === 1. Paths ===
+normal_path  = r"C:\Kurtay Finance Project\Modelling\EGARCH_fitting_Normal.csv"
+student_path = r"C:\Kurtay Finance Project\Modelling\EGARCH_studentt.csv"
+save_path    = r"C:\Kurtay Finance Project\Modelling\EGARCH_ModelComparison_AIC.csv"
+
+# === 2. Load data ===
+print("📂 Loading CSVs ...")
+normal  = pd.read_csv(normal_path)
+student = pd.read_csv(student_path)
+print(f"✅ Normal rows:  {len(normal)}")
+print(f"✅ Student-t rows: {len(student)}\n")
+
+# === 3. Standardize column names + add model flag ===
+for df, name in zip([normal, student], ["EGARCH_Normal", "EGARCH_StudentT"]):
+    df["model"] = name
+    df.columns = df.columns.str.lower()
+
+# === 4. Check if required columns exist ===
+required = {"ticker", "logl", "aic", "bic"}
+for name, df in zip(["Normal", "Student-t"], [normal, student]):
+    missing = required - set(df.columns)
+    if missing:
+        print(f"⚠️ {name} file missing columns: {missing}")
+    else:
+        print(f"✅ {name} file has all required columns.")
+
+# === 5. Check datatypes & NaN rates ===
+print("\n🔍 Validating numeric fields ...")
+for name, df in zip(["Normal", "Student-t"], [normal, student]):
+    print(f"\n{name} model:")
+    for col in ["aic", "bic", "logl"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+        nan_rate = df[col].isna().mean()
+        nonnum = df[col].apply(lambda x: isinstance(x, str)).sum()
+        print(f"  {col}: NaN={nan_rate:.2%}, Non-numeric={nonnum}")
+
+# === 6. Check ticker overlap ===
+overlap = set(normal["ticker"]).intersection(set(student["ticker"]))
+print(f"\n🔁 Shared tickers between models: {len(overlap)}")
+
+# === 7. Combine and compare ===
+keep_cols = ["ticker", "model", "logl", "aic", "bic"]
+combined = pd.concat([normal[keep_cols], student[keep_cols]], ignore_index=True)
+
+print("\n✅ Combined shape:", combined.shape)
+
+# === 8. Quick summary before ranking ===
+summary = combined.groupby("model")[["aic", "bic", "logl"]].agg(["mean", "std", "count"])
+print("\n📊 Summary of numeric metrics:")
+print(summary)
+
+# === 9. Identify tickers with missing AIC in Student-t ===
+missing_aic = student[student["aic"].isna()]["ticker"].tolist()
+if missing_aic:
+    print(f"\n⚠️ {len(missing_aic)} tickers have missing Student-t AIC values:")
+    print(missing_aic)
+else:
+    print("\n✅ No missing AIC values in Student-t file.")
+
+# === 10. Rank by AIC ===
+best = (
+    combined.sort_values(["ticker", "aic"])
+             .groupby("ticker")
+             .first()
+             .reset_index()
+             .rename(columns={
+                 "model": "Best_Model",
+                 "aic": "Best_AIC",
+                 "bic": "Best_BIC",
+                 "logl": "Best_LogL"
+             })
+)
+
+print("\n🏆 EGARCH Model Comparison Summary")
+print("----------------------------------")
+print(best["Best_Model"].value_counts(), "\n")
+
+# === 11. Average performance ===
+avg_aic = combined.groupby("model")["aic"].mean().sort_values()
+avg_bic = combined.groupby("model")["bic"].mean().sort_values()
+print("📈 Average AIC by model:\n", avg_aic, "\n")
+print("📈 Average BIC by model:\n", avg_bic, "\n")
+
+# === 12. Save results ===
+best.to_csv(save_path, index=False)
+print(f"💾 Saved detailed ranking to:\n{save_path}")
+# === 13. Compute AIC differences per ticker ===
+pivot = combined.pivot(index="ticker", columns="model", values="aic")
+pivot["ΔAIC"] = pivot["EGARCH_Normal"] - pivot["EGARCH_StudentT"]

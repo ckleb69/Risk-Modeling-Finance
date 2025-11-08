@@ -1,0 +1,67 @@
+import pandas as pd
+import numpy as np
+
+# === 1. File paths ===
+paths = {
+    "Normal EGARCH":   r"EGARCH_fitting_Normal.csv",
+    "Student-t EGARCH": r"EGARCH_studentt.csv",
+    "Pearson VII":      r"PearsonVII.csv"
+}
+
+# === 2. Helper checks ===
+def check_model(name, df, required_cols):
+    print(f"\n🔍 Checking {name} ...")
+    issues = []
+
+    # Missing columns
+    missing = [c for c in required_cols if c not in df.columns]
+    if missing:
+        issues.append(f"❌ Missing columns: {missing}")
+
+    # NaN values
+    if df.isna().sum().sum() > 0:
+        n = int(df.isna().sum().sum())
+        issues.append(f"⚠️ Contains {n} NaN values")
+
+    # Check parameter ranges
+    if "persistence" in df.columns:
+        unstable = (df["persistence"] >= 1).sum()
+        issues.append(f"⚠️ {unstable}/{len(df)} persistence ≥ 1")
+
+    if "nu" in df.columns:
+        bad_nu = ((df["nu"] < 2) | (df["nu"] > 50)).sum()
+        issues.append(f"⚠️ {bad_nu}/{len(df)} ν outside [2,50]")
+
+    if "m_hat" in df.columns:
+        bad_m = ((df["m_hat"] <= 2) | (df["m_hat"] > 100)).sum()
+        issues.append(f"⚠️ {bad_m}/{len(df)} m_hat outside (2,100]")
+
+    if "sigma_hat" in df.columns:
+        bad_sigma = (df["sigma_hat"] <= 0).sum()
+        issues.append(f"⚠️ {bad_sigma}/{len(df)} σ ≤ 0")
+
+    if not issues:
+        print(f"✅ {name} looks healthy: {len(df)} observations")
+    else:
+        print(f"{name} Summary:")
+        for i in issues:
+            print("   ", i)
+
+# === 3. Run checks ===
+for model_name, path in paths.items():
+    try:
+        df = pd.read_csv(path)
+        # choose required columns per model
+        if "Normal" in model_name:
+            required = ["ticker", "omega", "alpha[1]", "beta[1]", "persistence"]
+        elif "Student-t" in model_name:
+            required = ["ticker", "omega", "alpha[1]", "beta[1]", "persistence", "nu"]
+        else:  # Pearson VII
+            required = ["ticker", "mu_hat", "sigma_hat", "m_hat", "L1", "L2"]
+        check_model(model_name, df, required)
+    except FileNotFoundError:
+        print(f"❌ File not found: {path}")
+    except Exception as e:
+        print(f"❌ Error reading {path}: {e}")
+
+print("\n🏁 Model integrity check complete.")

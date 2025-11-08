@@ -1,0 +1,31 @@
+import pandas as pd
+
+# === 1. File paths ===
+file1 = r"C:\Kurtay Finance Project\Results\EGARCH_studentt_refitted.csv"
+file2 = r"C:\Kurtay Finance Project\Results\EGARCH_studentt2.csv"
+save_path = r"C:\Kurtay Finance Project\Results\EGARCH_studentt.csv"
+
+# === 2. Load both CSVs ===
+df1 = pd.read_csv(file1)
+df2 = pd.read_csv(file2)
+
+# === 3. Standardize ticker column name just in case ===
+df1.columns = [c.strip() for c in df1.columns]
+df2.columns = [c.strip() for c in df2.columns]
+
+# === 4. Merge by ticker, preferring df1 (refitted) when duplicates exist ===
+merged = pd.concat([df2, df1])  # df1 appended last so its values override
+merged = merged.drop_duplicates(subset=["ticker"], keep="last").reset_index(drop=True)
+
+# === 5. Save merged file ===
+merged.to_csv(save_path, index=False)
+print(f"✅ Merged results saved to:\n{save_path}")
+
+# === 6. Optional summary ===
+print("\n📊 Final Summary by stability_class:")
+if "stability_class" in merged.columns:
+    print(merged["stability_class"].value_counts())
+else:
+    print("No 'stability_class' column found.")
+
+print(f"\n✅ Total tickers in merged file: {merged['ticker'].nunique()}")

@@ -1,0 +1,85 @@
+import os
+import numpy as np
+import pandas as pd
+import warnings
+from arch import arch_model
+from statsmodels.stats.diagnostic import acorr_ljungbox
+warnings.filterwarnings("ignore")
+
+# -------- Paths --------
+IN_PATH  = r"C:\Kurtay Finance Project\Data\CLEANWRDS.csv"
+OUT_PATH = r"C:\Kurtay Finance Project\Results\EGARCH_Normal_Fixed.csv"
+os.makedirs(os.path.dirname(OUT_PATH), exist_ok=True)
+
+# -------- Tickers --------
+tech = ["AAPL","MSFT","INTC","CSCO","IBM","ORCL","NVDA","XRX","ADBE","QCOM","HPQ","ADP"]
+ind  = ["GE","MMM","CAT","DE","HON","UPS","FDX","UNP","BA","LMT","PH","EMR"]
+tickers = tech + ind
+
+# -------- Helper functions --------
+def preprocess_series(s, min_len=10):
+    x = pd.to_numeric(s, errors='coerce').dropna() * 1e6
+    if len(x) < min_len:
+        return pd.Series(dtype=float)
+    lo, hi = x.quantile(0.01), x.quantile(0.99)
+    x = x.clip(lo, hi)
+    if not np.isfinite(x.std()) or x.std() == 0:
+        return pd.Series(dtype=float)
+    return x
+
+def lb_pvalues(std_resid, lags=10):
+    r = pd.Series(std_resid).dropna()
+    if len(r) < lags + 5:
+        return np.nan, np.nan
+    lb_r  = acorr_ljungbox(r, lags=[lags], return_df=True)["lb_pvalue"].iloc[-1]
+    lb_sr = acorr_ljungbox(r**2, lags=[lags], return_df=True)["lb_pvalue"].iloc[-1]
+    return float(lb_r), float(lb_sr)
+
+# -------- Main loop --------
+df = pd.read_csv(IN_PATH)
+results, failed = [], []
+print("\n🚀 Running EGARCH(1,1) with Normal errors ...\n")
+
+for t in tickers:
+    print(f"================ {t} ================")
+    x = preprocess_series(df.loc[df["ticker"] == t, "log_ret"])
+    if x.empty:
+        print(f"⚠️ {t}: no usable data.")
+        failed.append((t, "no data"))
+        continue
+
+    try:
+        am = arch_model(x, vol="EGARCH", p=1, q=1, mean="Constant", dist="normal", rescale=True)
+        res = am.fit(disp="off", tol=1e-5)
+
+        alpha = res.params.get("alpha[1]", np.nan)
+        beta  = res.params.get("beta[1]", np.nan)
+        persistence = alpha + beta
+
+        lb_r, lb_sr = lb_pvalues(res.std_resid)
+
+        results.append({
+            "ticker": t,
+            "mu": res.params.get("mu", np.nan),
+            "omega": res.params.get("omega", np.nan),
+            "alpha[1]": alpha,
+            "beta[1]": beta,
+            "persistence": persistence,
+            "logL": res.loglikelihood,
+            "AIC": res.aic,
+            "BIC": res.bic,
+            "LB_pval_resid": lb_r,
+            "LB_pval_sqresid": lb_sr,
+            "convergence_flag": getattr(res, "convergence_flag", 0)
+        })
+        print(f"✅ {t}: α+β={persistence:.3f}, AIC={res.aic:.1f}, LB={lb_r:.3f}/{lb_sr:.3f}")
+
+    except Exception as e:
+        print(f"❌ {t}: EGARCH Normal failed — {e}")
+        failed.append((t, str(e)))
+
+res_df = pd.DataFrame(results)
+res_df.to_csv(OUT_PATH, index=False)
+print(f"\n💾 Saved Normal EGARCH results to:\n{OUT_PATH}")
+print(f"✅ Successful fits: {len(results)} | ❌ Failures: {len(failed)}")
+print(res_df.describe(include='all'))
