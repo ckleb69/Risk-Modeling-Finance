@@ -1,0 +1,11 @@
+from fredapi import Fred
+import pandas as pd
+
+fred = Fred(api_key="2f14998610b230348c5275c69b9144aa")
+data = fred.get_series("DGS3MO", observation_start="2000-01-01", observation_end="2025-12-31")
+df = pd.DataFrame(data, columns=["rf_rate"])
+df.index.name = "date"
+df["rf_rate"] = df["rf_rate"] / 100.0
+
+print(df.head())
+df.to_csv(r"C:\Kurtay Finance Project\Data\FRED_DGS3MO.csv")

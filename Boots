@@ -1,0 +1,141 @@
+import os, numpy as np, pandas as pd
+from math import log, pi
+from scipy.special import gamma
+from scipy.optimize import minimize
+from numpy.random import default_rng
+from tqdm import tqdm
+
+# ===============================================================
+# User Paths
+# ===============================================================
+BASE = r"C:\Kurtay Finance Project\Data"
+RESID_DIR = os.path.join(BASE, "Student_Residuals")
+CLEANWRDS = os.path.join(BASE, "CLEANWRDS.csv")  # optional sector merge
+OUT_FILE  = os.path.join(BASE, "Bootstrap_Robustness.csv")
+OUT_SUMMARY = os.path.join(BASE, "Bootstrap_SectorSummary.csv")
+
+# ===============================================================
+# Settings
+# ===============================================================
+B = 500            # number of bootstrap replications
+BLOCK = 5          # block length (5–10 days typical)
+ALPHA = 0.05       # for confidence bands
+rng = default_rng(1234)
+
+# ===============================================================
+# Likelihood helpers
+# ===============================================================
+def ll_normal(z):
+    return -0.5*np.sum(z**2 + log(2*pi))
+
+def ll_student_t(z, nu):
+    c = gamma((nu+1)/2)/(np.sqrt(nu*pi)*gamma(nu/2))
+    return np.sum(np.log(c) - ((nu+1)/2)*np.log(1 + z**2/nu))
+
+def ll_pearson7(z, m, s):
+    c = gamma(m)/(s*np.sqrt(pi)*gamma(m-0.5))
+    return np.sum(np.log(c) - m*np.log(1+(z/s)**2))
+
+def mle_student_t(z):
+    def nll(nu):
+        if nu<=2: return 1e20
+        return -ll_student_t(z, nu)
+    res = minimize(lambda x: nll(x[0]), x0=[8.0], bounds=[(2.01,200)], method="L-BFGS-B")
+    return res.x[0], -res.fun
+
+def mle_pearson7(z):
+    def nll(p):
+        m,s = p
+        if m<=1 or s<=1e-8: return 1e20
+        return -ll_pearson7(z,m,s)
+    res = minimize(nll, [3.0,np.std(z)], bounds=[(1.001,200),(1e-6,1e3)], method="L-BFGS-B")
+    return res.x, -res.fun
+
+# ===============================================================
+# Block bootstrap generator
+# ===============================================================
+def block_bootstrap(z, block=5):
+    n = len(z)
+    idxs = []
+    while len(idxs) < n:
+        start = rng.integers(0, n - block)
+        idxs.extend(range(start, start+block))
+    idxs = idxs[:n]
+    return z[idxs]
+
+# ===============================================================
+# Main loop
+# ===============================================================
+files = [f for f in os.listdir(RESID_DIR) if f.endswith("_resid.csv")]
+records = []
+
+print(f"\n🚀 Running block-bootstrap robustness with B={B}, block={BLOCK}\n")
+
+for f in tqdm(files):
+    tkr = f.replace("_resid.csv","")
+    z0 = pd.read_csv(os.path.join(RESID_DIR,f))["std_resid"].dropna().to_numpy()
+    n = len(z0)
+    if n < BLOCK+20:
+        continue
+
+    wins = {"Normal":0,"StudentT":0,"PearsonVII":0}
+    dAIC_tn, dAIC_p7t = [], []
+
+    for b in range(B):
+        z = block_bootstrap(z0, BLOCK)
+
+        # Normal
+        llN = ll_normal(z); kN=0; aicN = 2*kN - 2*llN
+
+        # Student-t
+        nu, llT = mle_student_t(z); kT=1; aicT=2*kT - 2*llT
+
+        # Pearson-VII
+        (m,s), llP = mle_pearson7(z); kP=2; aicP=2*kP - 2*llP
+
+        # choose winner
+        aics = {"Normal":aicN,"StudentT":aicT,"PearsonVII":aicP}
+        best = min(aics, key=aics.get)
+        wins[best]+=1
+        dAIC_tn.append(aicT - aicN)
+        dAIC_p7t.append(aicP - aicT)
+
+    total = sum(wins.values())
+    records.append({
+        "ticker":tkr, "n":n,
+        "PearsonVII_win_share":wins["PearsonVII"]/total,
+        "StudentT_win_share":wins["StudentT"]/total,
+        "Normal_win_share":wins["Normal"]/total,
+        "median_ΔAIC_t_norm":np.median(dAIC_tn),
+        "median_ΔAIC_p7_t":np.median(dAIC_p7t)
+    })
+
+boot = pd.DataFrame(records)
+boot.to_csv(OUT_FILE,index=False)
+print(f"\n💾 Saved per-ticker bootstrap results → {OUT_FILE}")
+
+# ===============================================================
+# Sector-level summary (optional)
+# ===============================================================
+if os.path.exists(CLEANWRDS):
+    meta = pd.read_csv(CLEANWRDS)
+    meta.columns = meta.columns.str.lower()
+    if "ticker" in meta.columns and "sector" in meta.columns:
+        meta["ticker"] = meta["ticker"].str.upper().str.strip()
+        boot["ticker"] = boot["ticker"].str.upper().str.strip()
+        df = boot.merge(meta[["ticker","sector"]], on="ticker", how="left")
+        summary = (
+            df.groupby("sector")
+              .agg(
+                  n_tickers=("ticker","nunique"),
+                  PearsonVII_win_share=("PearsonVII_win_share","mean"),
+                  StudentT_win_share=("StudentT_win_share","mean"),
+                  Normal_win_share=("Normal_win_share","mean"),
+                  median_ΔAIC_t_norm=("median_ΔAIC_t_norm","median"),
+                  median_ΔAIC_p7_t=("median_ΔAIC_p7_t","median")
+              )
+              .reset_index()
+        )
+        summary.to_csv(OUT_SUMMARY,index=False)
+        print(f"💾 Saved sector summary → {OUT_SUMMARY}\n")
+        print(summary)

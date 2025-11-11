@@ -1,0 +1,67 @@
+import pandas as pd
+import numpy as np
+import os
+
+# -------- Paths --------
+NORMAL_PATH  = r"C:\Kurtay Finance Project\Data\New_EGARCH_Normal13.csv"
+STUDENT_PATH = r"C:\Kurtay Finance Project\Data\New_EGARCH_Student.csv"
+SAVE_PATH    = r"C:\Kurtay Finance Project\Data\New_CompareNandT.csv"
+
+# -------- Load and label models --------
+normal  = pd.read_csv(NORMAL_PATH)
+student = pd.read_csv(STUDENT_PATH)
+
+for df, label in zip([normal, student], ["EGARCH_Normal", "EGARCH_StudentT"]):
+    df["model"] = label
+    df.columns = df.columns.str.lower()
+
+# -------- Keep comparable metrics --------
+keep = ["ticker", "model", "logl", "aic", "bic"]
+normal  = normal[keep]
+student = student[keep]
+
+# -------- Combine --------
+combined = pd.concat([normal, student], ignore_index=True)
+
+# -------- Clean numeric --------
+for c in ["logl", "aic", "bic"]:
+    combined[c] = pd.to_numeric(combined[c], errors="coerce")
+
+print(f"✅ Loaded {len(combined)} records across both models.")
+
+# -------- Drop tickers missing one model --------
+tick_counts = combined["ticker"].value_counts()
+shared_tickers = tick_counts[tick_counts == 2].index
+combined = combined[combined["ticker"].isin(shared_tickers)]
+
+# -------- Rank by AIC (lower = better) --------
+best = (
+    combined.sort_values(["ticker", "aic"])
+             .groupby("ticker")
+             .first()
+             .reset_index()
+             .rename(columns={
+                 "model": "Best_Model",
+                 "aic": "Best_AIC",
+                 "bic": "Best_BIC",
+                 "logl": "Best_LogL"
+             })
+)
+
+# -------- Summary --------
+print("\n🏆 Model Winner Counts:")
+print(best["Best_Model"].value_counts(), "\n")
+
+avg_stats = combined.groupby("model")[["aic","bic","logl"]].mean()
+print("📈 Average Fit Statistics:")
+print(avg_stats, "\n")
+
+# -------- Per-ticker AIC differences --------
+pivot = combined.pivot(index="ticker", columns="model", values="aic")
+pivot["ΔAIC"] = pivot["EGARCH_Normal"] - pivot["EGARCH_StudentT"]
+print("📉 Mean ΔAIC (Normal − Student-t):", pivot["ΔAIC"].mean())
+
+# -------- Save --------
+os.makedirs(os.path.dirname(SAVE_PATH), exist_ok=True)
+best.to_csv(SAVE_PATH, index=False)
+print(f"\n💾 Saved model comparison results to:\n{SAVE_PATH}")

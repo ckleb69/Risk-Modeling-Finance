@@ -1,0 +1,92 @@
+import os
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from scipy.stats import norm, t
+from scipy.special import gamma
+from scipy.interpolate import interp1d
+
+# ===============================================================
+# User Paths
+# ===============================================================
+BASE = r"C:\Kurtay Finance Project\Data"
+RESID_DIR = os.path.join(BASE, "Student_Residuals")
+FIT_FILE  = os.path.join(BASE, "ResidualOnly_AICBIC_Normal_t_PVII.csv")
+PLOT_DIR  = os.path.join(BASE, "Residual_FitPlots")
+os.makedirs(PLOT_DIR, exist_ok=True)
+
+# ===============================================================
+# Pearson-VII helpers
+# ===============================================================
+def pearson7_pdf(x, m, s):
+    """Pearson-VII PDF with loc=0."""
+    c = gamma(m) / (s * np.sqrt(np.pi) * gamma(m - 0.5))
+    return c * (1 + (x/s)**2) ** (-m)
+
+def pearson7_ppf(u, m, s):
+    """Numerical inverse CDF for Q–Q plotting."""
+    grid = np.linspace(-10*s, 10*s, 8000)
+    pdf = pearson7_pdf(grid, m, s)
+    cdf = np.cumsum(pdf)
+    cdf /= cdf[-1]
+    return interp1d(cdf, grid, bounds_error=False,
+                    fill_value=(grid[0], grid[-1]))(u)
+
+# ===============================================================
+# Load parameter estimates
+# ===============================================================
+fit = pd.read_csv(FIT_FILE).set_index("ticker")
+
+# Choose example tickers (edit list as you like)
+tickers = ["AAPL", "MSFT", "DE", "HPQ"]
+
+print(f"\n🚀 Creating goodness-of-fit plots for {len(tickers)} tickers...\n")
+
+for tkr in tickers:
+    resid_path = os.path.join(RESID_DIR, f"{tkr}_resid.csv")
+    if not os.path.exists(resid_path):
+        print(f"⚠️  Residuals missing for {tkr}, skipping.")
+        continue
+
+    # ---------- Load residuals ----------
+    z = pd.read_csv(resid_path)["std_resid"].dropna().to_numpy()
+    params = fit.loc[tkr]
+    nu, m, s = params["nu_hat"], params["m_hat"], params["scale_hat"]
+
+    # ---------- Histogram + fitted PDFs ----------
+    grid = np.linspace(z.min(), z.max(), 600)
+    plt.figure(figsize=(9,4))
+    plt.hist(z, bins=60, density=True, color="lightgray",
+             edgecolor="black", alpha=0.6, label="Empirical")
+
+    plt.plot(grid, norm.pdf(grid, 0, 1), "b--", lw=1.8, label="Normal(0,1)")
+    plt.plot(grid, t.pdf(grid, df=nu), "g-",  lw=1.8, label=f"Student-t (ν={nu:.1f})")
+    plt.plot(grid, pearson7_pdf(grid, m, s), "r-", lw=2.2,
+             label=f"Pearson-VII (m={m:.1f})")
+
+    plt.title(f"{tkr} — Innovation Density Fit")
+    plt.xlabel("Standardized Residual")
+    plt.ylabel("Density")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(os.path.join(PLOT_DIR, f"{tkr}_hist_fit.png"))
+    plt.close()
+
+    # ---------- Q–Q Plot vs Pearson-VII ----------
+    q = np.linspace(0.01, 0.99, 500)
+    emp_q = np.quantile(z, q)
+    theo_q = pearson7_ppf(q, m, s)
+    plt.figure(figsize=(5,5))
+    plt.scatter(theo_q, emp_q, s=10, color="navy", alpha=0.7)
+    lims = [min(emp_q.min(), theo_q.min()), max(emp_q.max(), theo_q.max())]
+    plt.plot(lims, lims, "r--")
+    plt.title(f"{tkr} — Q–Q Plot vs Pearson-VII")
+    plt.xlabel("Theoretical Quantiles")
+    plt.ylabel("Empirical Quantiles")
+    plt.tight_layout()
+    plt.savefig(os.path.join(PLOT_DIR, f"{tkr}_QQ_PearsonVII.png"))
+    plt.close()
+
+    print(f"✅ Saved {tkr} plots")
+
+print(f"\n📁 All plots saved in: {PLOT_DIR}")
