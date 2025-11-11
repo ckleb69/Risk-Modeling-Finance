@@ -1,0 +1,274 @@
+import os
+import numpy as np
+import pandas as pd
+from datetime import datetime
+from arch import arch_model
+from scipy.special import gamma
+from scipy.optimize import minimize
+
+# ============================================================
+# Paths & Config
+# ============================================================
+BASE = r"C:\Kurtay Finance Project\Data\Finance"
+IN_RET = os.path.join(BASE, "CLEANWRDS.csv")            # must have columns: date, ticker, log_ret
+IN_RATE = os.path.join(BASE, "FRED_DGS3MO.csv")         # must have columns: date (or DATE), rf_rate (decimal)
+OUT_BOOT = os.path.join(BASE,  "RateRegime_Boot_AICBIC.csv")
+OUT_SUMM = os.path.join(BASE, "RateRegime_WinShare_Summary.csv")
+os.makedirs(os.path.dirname(OUT_BOOT), exist_ok=True)
+
+# Bootstrap settings
+BLOCK_LEN = 30      # days per block
+N_BOOT = 5         # bootstraps per ticker × regime (adjust as desired)
+MIN_REGIME_LEN = 250  # skip regimes shorter than this per ticker
+SEED = 123
+np.random.seed(SEED)
+
+# EGARCH/returns settings
+RET_SCALE = 100.0   # scale returns to % (stability)
+EGARCH_P, EGARCH_Q = 1, 3
+EGARCH_DIST = "t"   # base fit to get z_t
+VERBOSE_TICKERS = 3  # print debug for first few tickers
+
+# ============================================================
+# Utilities: likelihoods on standardized residuals z
+# ============================================================
+LOG2PI = np.log(2 * np.pi)
+
+def ll_normal(z):
+    # Standard Normal(0,1)
+    return -0.5 * np.sum(z**2 + LOG2PI)
+
+def ll_student_t(z, nu):
+    # Standardized Student-t with df=nu, mean=0, scale=1
+    if nu <= 2:  # ensure finite variance; but we only use likelihood so allow > 0? stick with > 2
+        return -np.inf
+    c = gamma((nu + 1) / 2) / (np.sqrt(nu * np.pi) * gamma(nu / 2))
+    return np.sum(np.log(c) - ((nu + 1) / 2) * np.log(1 + z**2 / nu))
+
+def ll_pearson7(z, m, s):
+    # Pearson VII log-likelihood with safe domain checks
+    if not np.isfinite(m) or not np.isfinite(s) or m <= 0.5 or s <= 0:
+        return -np.inf
+    try:
+        denom = s * np.sqrt(np.pi) * gamma(m - 0.5)
+        if denom <= 0 or not np.isfinite(denom):
+            return -np.inf
+        c = gamma(m) / denom
+        if not np.isfinite(c) or c <= 0:
+            return -np.inf
+        ll = np.sum(np.log(c) - m * np.log1p((z / s) ** 2))
+        return ll if np.isfinite(ll) else -np.inf
+    except Exception:
+        return -np.inf
+def aic_bic(logL, k, n):
+    AIC = 2 * k - 2 * logL
+    BIC = np.log(n) * k - 2 * logL
+    return AIC, BIC
+
+def fit_student_t_mle(z):
+    # Optimize nu > 2 (finite variance); start at 6
+    z = np.asarray(z)
+    def neg_ll(params):
+        nu = params[0]
+        return -(ll_student_t(z, nu))
+    res = minimize(neg_ll, x0=np.array([6.0]),
+                   bounds=[(2.01, 200.0)],
+                   method="L-BFGS-B")
+    nu_hat = float(res.x[0]) if res.success else np.nan
+    logL = ll_student_t(z, nu_hat) if res.success else -np.inf
+    return nu_hat, logL
+
+def fit_pearson7_mle(z):
+    # Optimize m>0.5, s>0; start from (m=3.5, s=2.0)
+    z = np.asarray(z)
+    def neg_ll(params):
+        m, s = params
+        return -(ll_pearson7(z, m, s))
+    res = minimize(neg_ll, x0=np.array([3.5, 2.0]),
+                   bounds=[(0.51, 200.0), (1e-6, 200.0)],
+                   method="L-BFGS-B")
+    if res.success:
+        m_hat, s_hat = map(float, res.x)
+        logL = ll_pearson7(z, m_hat, s_hat)
+    else:
+        m_hat, s_hat, logL = np.nan, np.nan, -np.inf
+    return m_hat, s_hat, logL
+
+# ============================================================
+# Bootstrap helper
+# ============================================================
+def block_bootstrap(series, block_len=30, n_boot=100):
+    """Return a list of bootstrap series (same length as input), sampling contiguous blocks with replacement."""
+    s = series.reset_index(drop=True)
+    n = len(s)
+    if n <= block_len + 1:
+        return []
+    starts = np.arange(0, n - block_len)
+    out = []
+    for _ in range(n_boot):
+        k = int(np.ceil(n / block_len))
+        chosen = np.random.choice(starts, size=k, replace=True)
+        idx = np.concatenate([np.arange(st, st + block_len) for st in chosen])[:n]
+        out.append(s.iloc[idx].reset_index(drop=True))
+    return out
+
+# ============================================================
+# Data load & merge
+# ============================================================
+print("📥 Loading data...")
+ret = pd.read_csv(IN_RET)
+ret.columns = ret.columns.str.lower()
+ret["ticker"] = ret["ticker"].str.upper().str.strip()
+if "date" in ret.columns:
+    ret["date"] = pd.to_datetime(ret["date"])
+else:
+    raise ValueError("CLEANWRDS.csv must contain a 'date' column.")
+
+rate = pd.read_csv(IN_RATE)
+rate.columns = [c.lower() for c in rate.columns]
+if "date" not in rate.columns and "date" in rate.columns:
+    pass
+if "date" not in rate.columns and "date" not in rate.columns:
+    # try to find DATE column
+    if "date" not in rate.columns and "date" not in rate.columns and "DATE".lower() not in rate.columns:
+        raise ValueError("FRED_DGS3MO.csv must contain a date/DATE column.")
+if "date" not in rate.columns and "date" in rate.columns:
+    rate = rate.rename(columns={"DATE".lower(): "date"})
+rate["date"] = pd.to_datetime(rate["date"])
+
+# Expect rf_rate column already decimal; if not, try to infer
+if "rf_rate" not in rate.columns:
+    # Try to infer from common FRED export names
+    # e.g., column could be "dgs3mo" in percent
+    candidates = [c for c in rate.columns if c not in ["date"]]
+    if not candidates:
+        raise ValueError("FRED_DGS3MO.csv must include a rate column (e.g., 'rf_rate' or 'dgs3mo').")
+    col = candidates[0]
+    rate = rate.rename(columns={col: "rf_rate"})
+    # assume percent; convert to decimal if values look > 1
+    if rate["rf_rate"].dropna().median() > 1:
+        rate["rf_rate"] = rate["rf_rate"] / 100.0
+
+# Inner join to keep overlapping dates
+df = ret.merge(rate[["date", "rf_rate"]], on="date", how="inner").dropna(subset=["log_ret", "rf_rate"])
+df = df.sort_values(["ticker", "date"]).reset_index(drop=True)
+
+# Rate regimes by terciles (per full sample)
+df["rate_regime"] = pd.qcut(df["rf_rate"], q=3, labels=["Low", "Medium", "High"])
+
+tickers = df["ticker"].unique().tolist()
+print(f"✅ Merged rows: {len(df):,} | Unique tickers: {len(tickers)}")
+print(df[["date","ticker","log_ret","rf_rate","rate_regime"]].head())
+
+# ============================================================
+# Main loop
+# ============================================================
+rows = []
+printed = 0
+
+for tkr in tickers:
+    dtk = df[df["ticker"] == tkr].copy()
+    # Work in percent units for EGARCH stability
+    dtk["ret_scaled"] = pd.to_numeric(dtk["log_ret"], errors="coerce") * RET_SCALE
+    dtk = dtk.dropna(subset=["ret_scaled"])
+
+    for regime in ["Low", "Medium", "High"]:
+        sub = dtk[dtk["rate_regime"] == regime].copy()
+        n_reg = len(sub)
+        if n_reg < MIN_REGIME_LEN:
+            continue
+
+        # Generate bootstrap samples from regime-restricted series
+        boots = block_bootstrap(sub["ret_scaled"], block_len=BLOCK_LEN, n_boot=N_BOOT)
+        if not boots:
+            continue
+
+        if printed < VERBOSE_TICKERS:
+            print(f"\n🚀 {tkr} | Regime={regime} | n={n_reg} | bootstraps={len(boots)}")
+            printed += 1
+
+        for bidx, boot_series in enumerate(boots, start=1):
+            z = None
+            try:
+                # Fit EGARCH(1,3)-t to get standardized residuals
+                am = arch_model(boot_series, vol="EGARCH", p=EGARCH_P, q=EGARCH_Q,
+                                mean="Constant", dist=EGARCH_DIST, rescale=False)
+                res = am.fit(disp="off")
+
+                # Standardized residuals (z_t)
+                z = pd.Series(res.std_resid).dropna().values
+                n = len(z)
+                if n < 50:
+                    continue
+
+                # --- Residual-only fits ---
+                # Normal
+                logL_N = ll_normal(z)
+                AIC_N, BIC_N = aic_bic(logL_N, k=0, n=n)
+
+                # Student-t (MLE for nu)
+                nu_hat, logL_T = fit_student_t_mle(z)
+                AIC_T, BIC_T = aic_bic(logL_T, k=1, n=n)
+
+                # Pearson-VII (MLE for m, scale)
+                m_hat, s_hat, logL_P = fit_pearson7_mle(z)
+                AIC_P, BIC_P = aic_bic(logL_P, k=2, n=n)
+
+                # Identify best by AIC
+                aics = {"Normal": AIC_N, "StudentT": AIC_T, "PearsonVII": AIC_P}
+                best_aic = min(aics, key=aics.get)
+
+                rows.append({
+                    "ticker": tkr, "regime": regime, "boot_id": bidx, "n": n,
+                    "AIC_Normal": AIC_N, "BIC_Normal": BIC_N, "logL_Normal": logL_N,
+                    "AIC_StudentT": AIC_T, "BIC_StudentT": BIC_T, "logL_StudentT": logL_T,
+                    "nu_hat": nu_hat,
+                    "AIC_PearsonVII": AIC_P, "BIC_PearsonVII": BIC_P, "logL_PearsonVII": logL_P,
+                    "m_hat": m_hat, "scale_hat": s_hat,
+                    "Best_AIC": best_aic
+                })
+
+            except Exception as e:
+                # Record failure for transparency
+                rows.append({
+                    "ticker": tkr, "regime": regime, "boot_id": bidx,
+                    "error": str(e)
+                })
+                continue
+
+# ============================================================
+# Save results and win shares
+# ============================================================
+boot_df = pd.DataFrame(rows)
+boot_df.to_csv(OUT_BOOT, index=False)
+print(f"\n💾 Saved per-bootstrap results → {OUT_BOOT}")
+print(f"Rows: {len(boot_df):,}")
+
+# Filter successful fits
+ok = boot_df.dropna(subset=["Best_AIC"])
+
+# Win share by regime (overall)
+win_share_regime = (
+    ok.pivot_table(index="regime", columns="Best_AIC", values="ticker", aggfunc="count")
+      .fillna(0)
+)
+win_share_regime = win_share_regime.div(win_share_regime.sum(axis=1), axis=0)
+
+# Win share by regime and ticker
+win_share_by_ticker = (
+    ok.pivot_table(index=["regime","ticker"], columns="Best_AIC", values="boot_id", aggfunc="count")
+      .fillna(0)
+)
+share_by_ticker = win_share_by_ticker.div(win_share_by_ticker.sum(axis=1), axis=0).reset_index()
+
+# Combined summary output
+summary_out = []
+win_share_regime.reset_index().assign(level="ALL").pipe(summary_out.append)
+share_by_ticker.assign(level="TICKER").pipe(summary_out.append)
+summary_all = pd.concat(summary_out, ignore_index=True)
+summary_all.to_csv(OUT_SUMM, index=False)
+print(f"💾 Saved win-share summary → {OUT_SUMM}")
+
+# Pretty print quick view
+print("\n📊 AIC Win Share by Regime (overall):")
+print(win_share_regime.round(3))
